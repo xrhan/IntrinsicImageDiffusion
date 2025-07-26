@@ -243,10 +243,132 @@ def predict_materials(model, img, num_samples, sampling_batch_size=1, original_s
     return preds
 
 
+from pathlib import Path
+import torch
+from torchvision.transforms import Resize, ToPILImage
+
+
+def material_diffusion_albedo(cfg: DictConfig):
+    module_logger = init_logger("MaterialDiffusion_MAIN")
+
+    # ============= CONFIG =============
+    OmegaConf.resolve(cfg)
+    module_logger.info(f"Experiment config: \n{OmegaConf.to_yaml(cfg)}")
+
+    # set seed for reproducibility
+    if cfg.seed is not None:
+        pytorch_lightning.seed_everything(cfg.seed, workers=True)
+
+    # pick device
+    device = cfg.device
+    if device == "auto":
+        device = torch.device("mps") if torch.backends.mps.is_available() \
+                 else torch.device("cuda") if torch.cuda.is_available() \
+                 else torch.device("cpu")
+    module_logger.info(f"Running on {device}")
+
+    # instantiate model once
+    # Load config
+    config = OmegaConf.load(cfg.model.config_path)
+
+    # Init model
+    model = IntrinsicImageDiffusion(unet_config=config.unet_config,
+                                    diffusion_config=config.diffusion_config,
+                                    ddim_config=config.ddim_config)
+
+    # Load weights
+    module_logger.info(f"Loading model <{cfg.model.ckpt_path}>")
+    ckpt = torch.load(cfg.model.ckpt_path)
+    model.load_state_dict(ckpt)
+    model = model.to(device)
+
+    # ============= DATA LOOP =============
+    input_dir = Path("corrected_images")
+    output_dir = Path("albedo_results")
+    for img_path in input_dir.glob("*_original_gamma.png"):
+        module_logger.info(f"Loading input <{img_path}>")
+        # load your linear‐space image reader
+        img = load_linear_image(str(img_path))
+
+        # prep as a batch
+        transforms = Compose([ToTensor(), Resize(size=[480, 640])])
+        img = transforms(img).unsqueeze(0).to(device)
+        original_size = img.shape[-2:]
+        image_id = img_path.stem
+
+        # run inference & save **all** samples
+        predict_materials_batch(
+            model,
+            img,
+            num_samples=cfg.model.num_samples,
+            sampling_batch_size=cfg.model.sampling_batch_size,
+            original_size=original_size,
+            output_dir=output_dir,
+            image_id=image_id,
+        )
+
+    module_logger.info("All done.")
+
+
+def predict_materials_batch(model,
+                      img,
+                      num_samples: int,
+                      sampling_batch_size: int = 1,
+                      original_size=None,
+                      output_dir=None,
+                      image_id: str = None):
+    """
+    Samples `num_samples` outputs (in batches of sampling_batch_size),
+    resizes them back to original_size, then saves each sample as three PNGs:
+      {image_id}_albedo_sample{idx}.png
+      {image_id}_roughness_sample{idx}.png
+      {image_id}_metal_sample{idx}.png
+    under `output_dir`.
+    """
+    # 1) generate
+    parts = []
+    n_iter = (num_samples + sampling_batch_size - 1) // sampling_batch_size
+    for _ in range(n_iter):
+        parts.append(
+            model.sample(
+                batch_size=sampling_batch_size,
+                conditioning_img=img.to(model.device)
+            )
+        )
+    preds = torch.cat(parts, dim=0)[:num_samples]  # trim any excess
+
+    # 2) resize back
+    if original_size is not None:
+        resize = Resize(size=original_size)
+        preds = resize(preds)
+
+    # 3) save as PNG
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    to_pil = ToPILImage()
+
+    for idx, sample in enumerate(preds):
+        # sample: [C, H, W], where
+        #   channels 0–2 = albedo (RGB),
+        #   channel 3    = roughness (grayscale),
+        #   channel 4    = metallic  (grayscale)
+        albedo = sample[0:3].cpu()
+        rough  = sample[3].unsqueeze(0).cpu()
+        metal  = sample[4].unsqueeze(0).cpu()
+
+        to_pil(albedo) \
+            .save(output_dir / f"{image_id}_albedo_sample{idx}.png")
+        to_pil(rough) \
+            .save(output_dir / f"{image_id}_roughness_sample{idx}.png")
+        to_pil(metal) \
+            .save(output_dir / f"{image_id}_metal_sample{idx}.png")
+
+
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="stage/material_diffusion.yaml")
 def main(cfg: DictConfig):
     # material_diffusion(cfg)
-    material_diffusion_many(cfg)
+    # material_diffusion_many(cfg)
+    material_diffusion_albedo(cfg)
 
 
 if __name__ == "__main__":
